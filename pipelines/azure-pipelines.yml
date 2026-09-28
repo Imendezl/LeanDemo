@@ -1,0 +1,391 @@
+# ============================================================================
+# DEMO · Entorno de QA dinámico en Azure
+#
+# Un entorno efímero COMPLETO por cada ejecución del pipeline:
+#   Provision → Deploy → Tests → Cleanup (siempre, aunque fallen las pruebas)
+#
+# Requisitos (una sola vez):
+#   1. Service connection de tipo Azure Resource Manager llamada 'qa-demo-azure'
+#      (Project settings → Service connections → Azure Resource Manager).
+#   2. Guardar este fichero como 'azure-pipelines.yml' en la raíz del repo y
+#      crear el pipeline apuntando a él.
+# ============================================================================
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  # DATO DINÁMICO nº1: cada build recibe su PROPIO entorno (nombre único)
+  - name: environmentName
+    value: $[ format('qa-build-{0}', variables['Build.BuildId']) ]
+  - name: nodeVersion
+    value: '20.x'
+  - name: azureServiceConnection
+    value: 'qa-demo-azure'
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  # ──────────────────────────────────────────────────────────────────────────
+  # 1 · APROVISIONAMIENTO (Terraform): recursos con nombres dinámicos y TTL
+  # ──────────────────────────────────────────────────────────────────────────
+  - stage: Provision
+    displayName: 'Aprovisionar entorno efímero (Terraform)'
+    jobs:
+      - job: terraform
+        steps:
+          - checkout: self
+
+          # Caché de plugins de Terraform: evita redescargar el provider azurerm (~100 MB) en cada build
+          - task: Cache@2
+            displayName: 'Caché de plugins de Terraform'
+            inputs:
+              key: 'terraform-plugins | "$(Agent.OS)" | infra/.terraform.lock.hcl'
+              restoreKeys: |
+                terraform-plugins | "$(Agent.OS)"
+              path: $(Pipeline.Workspace)/.terraform-plugin-cache
+
+          - task: Bash@3
+            displayName: 'Instalar Terraform'
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+                TF_VERSION=1.9.8
+                curl -sL -o /tmp/tf.zip "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
+                sudo unzip -o /tmp/tf.zip -d /usr/local/bin
+                mkdir -p "$(Pipeline.Workspace)/.terraform-plugin-cache"
+                terraform version
+
+          - task: AzureCLI@2
+            displayName: 'Registrar resource providers (si faltan)'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                CONSULTA="[?namespace=='Microsoft.Web' || namespace=='Microsoft.Insights' || namespace=='Microsoft.OperationalInsights' || namespace=='Microsoft.Storage'].{ns:namespace, st:registrationState}"
+                pendientes() {
+                  az provider list --query "$CONSULTA" -o tsv | awk '$2!="Registered"{print $1}'
+                }
+                PEND="$(pendientes || true)"
+                if [ -n "$PEND" ]; then
+                  for ns in $PEND; do echo "Registrando $ns…"; az provider register -n "$ns" >/dev/null; done
+                  for i in $(seq 1 60); do
+                    PEND="$(pendientes || true)"
+                    if [ -z "$PEND" ]; then break; fi
+                    echo "  esperando registro: $PEND (intento $i/60)"
+                    sleep 10
+                  done
+                  if [ -n "$PEND" ]; then echo "✘ Providers sin registrar tras 10 minutos" >&2; exit 1; fi
+                fi
+                echo "✔ Resource providers listos"
+
+          - task: AzureCLI@2
+            name: tf
+            displayName: 'terraform init + apply'
+            env:
+              TF_PLUGIN_CACHE_DIR: $(Pipeline.Workspace)/.terraform-plugin-cache
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                # La service connection usa workload identity federation (OIDC): no hay secreto.
+                # Terraform autentica intercambiando el token federado del pipeline.
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export ARM_USE_OIDC=true
+                export ARM_OIDC_TOKEN="$idToken"
+
+                cd infra
+                terraform init -input=false -backend=false
+                terraform apply -auto-approve -input=false \
+                  -var "environment_name=$(environmentName)"
+
+                terraform output -json > "$(Build.ArtifactStagingDirectory)/terraform-outputs.json"
+                echo "##vso[task.setvariable variable=webappUrl;isOutput=true]$(terraform output -raw webapp_url)"
+                echo "##vso[task.setvariable variable=webappName;isOutput=true]$(terraform output -raw webapp_name)"
+                echo "##vso[task.setvariable variable=resourceGroupName;isOutput=true]$(terraform output -raw resource_group_name)"
+
+          # El estado viaja como artefacto: la etapa Cleanup lo necesita para destruir.
+          # Se publica SIEMPRE: si apply falla a medias, Cleanup puede limpiar lo creado.
+          # (En producción: backend azurerm remoto, ver infra/versions.tf)
+          - task: CopyFiles@2
+            displayName: 'Preparar artefacto de estado'
+            condition: always()
+            inputs:
+              SourceFolder: infra
+              Contents: 'terraform.tfstate'
+              TargetFolder: '$(Build.ArtifactStagingDirectory)/tfstate'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publicar estado de Terraform'
+            condition: always()
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/tfstate'
+              artifact: tfstate
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publicar outputs de Terraform'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/terraform-outputs.json'
+              artifact: terraform-outputs
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 2 · CONFIGURACIÓN Y DESPLIEGUE: build + zip deploy + smoke test
+  # ──────────────────────────────────────────────────────────────────────────
+  - stage: Deploy
+    displayName: 'Configurar y desplegar la aplicación'
+    dependsOn: Provision
+    variables:
+      webappUrl: $[ stageDependencies.Provision.terraform.outputs['tf.webappUrl'] ]
+      webappName: $[ stageDependencies.Provision.terraform.outputs['tf.webappName'] ]
+      resourceGroupName: $[ stageDependencies.Provision.terraform.outputs['tf.resourceGroupName'] ]
+    jobs:
+      - job: deploy
+        steps:
+          - checkout: self
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(nodeVersion)
+
+          - task: Bash@3
+            displayName: 'Build frontend + empaquetar'
+            inputs:
+              targetType: inline
+              workingDirectory: $(Build.SourcesDirectory)
+              script: |
+                set -euo pipefail
+                # Frontend compilado
+                cd app/frontend && npm ci --no-audit --no-fund && npm run build
+                cd "$(Build.SourcesDirectory)"
+                # Dependencias de producción del backend incluidas en el paquete:
+                # así App Service no ejecuta Oryx (SCM_DO_BUILD_DURING_DEPLOYMENT=false)
+                cd app/backend && npm ci --omit=dev --no-audit --no-fund
+                cd "$(Build.SourcesDirectory)"
+                STAGING="$(Build.ArtifactStagingDirectory)/pkg"
+                rm -rf "$STAGING" && mkdir -p "$STAGING/public"
+                cp app/backend/package.json "$STAGING/"
+                cp -r app/backend/src "$STAGING/src"
+                cp -r app/backend/node_modules "$STAGING/node_modules"
+                cp -r app/frontend/dist/. "$STAGING/public/"
+                cd "$STAGING" && zip -qr "$(Build.ArtifactStagingDirectory)/app.zip" .
+
+          - task: AzureCLI@2
+            displayName: 'Desplegar en App Service'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                az webapp deploy \
+                  --resource-group $(resourceGroupName) \
+                  --name $(webappName) \
+                  --src-path "$(Build.ArtifactStagingDirectory)/app.zip" \
+                  --type zip
+
+          - task: Bash@3
+            displayName: 'Smoke test de salud (/api/health)'
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+                BASE_URL="$(webappUrl)"
+                for i in $(seq 1 40); do
+                  if curl -sf "$BASE_URL/api/health"; then
+                    echo ""
+                    echo "✔ Aplicación sana en $BASE_URL"
+                    exit 0
+                  fi
+                  echo "  intento $i/40…"; sleep 5
+                done
+                echo "✘ La aplicación no está sana tras el despliegue" >&2
+                exit 1
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 3 · EJECUCIÓN DE PRUEBAS: BDD (Gherkin ES) + Playwright contra el entorno
+  # ──────────────────────────────────────────────────────────────────────────
+  - stage: Tests
+    displayName: 'Ejecutar pruebas BDD (Playwright)'
+    dependsOn:
+      - Provision   # dependencia explícita: stageDependencies no es transitivo
+      - Deploy
+    variables:
+      webappUrl: $[ stageDependencies.Provision.terraform.outputs['tf.webappUrl'] ]
+    jobs:
+      - job: bdd
+        steps:
+          - checkout: self
+
+          # Caché de paquetes npm y de navegadores de Playwright (~120 MB): solo se
+          # redescargan si cambia package-lock.json
+          - task: Cache@2
+            displayName: 'Caché npm'
+            inputs:
+              key: 'npm | "$(Agent.OS)" | tests/package-lock.json'
+              path: $(HOME)/.npm
+
+          - task: Cache@2
+            displayName: 'Caché navegadores Playwright'
+            inputs:
+              key: 'ms-playwright | "$(Agent.OS)" | tests/package-lock.json'
+              restoreKeys: |
+                ms-playwright | "$(Agent.OS)"
+              path: $(HOME)/.cache/ms-playwright
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(nodeVersion)
+
+          - task: Bash@3
+            displayName: 'Instalar dependencias + Chromium'
+            inputs:
+              targetType: inline
+              workingDirectory: $(Build.SourcesDirectory)/tests
+              script: |
+                set -euo pipefail
+                npm ci --no-audit --no-fund
+                npx playwright install --with-deps chromium
+
+          - task: Bash@3
+            displayName: 'bddgen + playwright test'
+            inputs:
+              targetType: inline
+              workingDirectory: $(Build.SourcesDirectory)/tests
+              script: |
+                set -euo pipefail
+                if [ -z "$(webappUrl)" ]; then
+                  echo "✘ La variable webappUrl no se resolvió desde la etapa Provision" >&2
+                  exit 1
+                fi
+                export BASE_URL="$(webappUrl)"
+                export CI=1
+                npm test
+
+          # Informe de QA nº1: resultados en la pestaña Tests de Azure DevOps
+          - task: PublishTestResults@2
+            displayName: 'Publicar resultados (JUnit → pestaña Tests)'
+            condition: always()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: 'tests/reports/junit.xml'
+              testRunTitle: 'QA Dinámico · $(environmentName)'
+              mergeTestResults: true
+
+          # Informe de QA nº2: HTML de Playwright como artefacto descargable
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publicar informe HTML (artefacto)'
+            condition: always()
+            inputs:
+              targetPath: '$(Build.SourcesDirectory)/tests/reports/html'
+              artifact: qa-report-html
+
+          # Informe de QA nº3: publicado en el sitio estático del propio entorno
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Descargar outputs de Terraform'
+            inputs:
+              artifact: terraform-outputs
+              targetPath: '$(Build.ArtifactStagingDirectory)/tfout'
+
+          - task: AzureCLI@2
+            displayName: 'Publicar informe en Azure Storage'
+            condition: always()
+            continueOnError: true   # requiere 'Storage Blob Data Contributor' en la service connection
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                REPORTS_ACCOUNT=$(node -e "console.log(require('$(Build.ArtifactStagingDirectory)/tfout/terraform-outputs.json').reports_storage_account.value)")
+                az storage blob upload-batch \
+                  --destination '$web' \
+                  --account-name "$REPORTS_ACCOUNT" \
+                  --auth-mode key \
+                  --source "$(Build.SourcesDirectory)/tests/reports/html" \
+                  --overwrite
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 4 · LIMPIEZA: destrucción SIEMPRE del entorno efímero (coste residual 0)
+  # ──────────────────────────────────────────────────────────────────────────
+  - stage: Cleanup
+    displayName: 'Limpiar entorno efímero (terraform destroy)'
+    condition: always()   # aunque Provision/Deploy/Tests fallen
+    dependsOn:
+      - Provision
+      - Deploy
+      - Tests
+    jobs:
+      - job: destroy
+        steps:
+          - checkout: self
+
+          # Misma caché de plugins que Provision: destroy arranca mucho más rápido
+          - task: Cache@2
+            displayName: 'Caché de plugins de Terraform'
+            inputs:
+              key: 'terraform-plugins | "$(Agent.OS)" | infra/.terraform.lock.hcl'
+              restoreKeys: |
+                terraform-plugins | "$(Agent.OS)"
+              path: $(Pipeline.Workspace)/.terraform-plugin-cache
+
+          - task: Bash@3
+            displayName: 'Instalar Terraform'
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+                TF_VERSION=1.9.8
+                curl -sL -o /tmp/tf.zip "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
+                sudo unzip -o /tmp/tf.zip -d /usr/local/bin
+                mkdir -p "$(Pipeline.Workspace)/.terraform-plugin-cache"
+                terraform version
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Recuperar estado de Terraform'
+            condition: always()
+            continueOnError: true   # si Provision no llegó a crear estado, Cleanup avisa y termina limpio
+            inputs:
+              artifact: tfstate
+              targetPath: '$(Build.SourcesDirectory)/infra'
+
+          - task: AzureCLI@2
+            displayName: 'terraform destroy'
+            condition: succeededOrFailed()
+            env:
+              TF_PLUGIN_CACHE_DIR: $(Pipeline.Workspace)/.terraform-plugin-cache
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export ARM_USE_OIDC=true
+                export ARM_OIDC_TOKEN="$idToken"
+
+                cd infra
+                if [ ! -f terraform.tfstate ]; then
+                  echo "No hay estado de Terraform: Provision no llegó a crear recursos. Nada que destruir."
+                  exit 0
+                fi
+                terraform init -input=false -backend=false
+                terraform destroy -auto-approve -input=false \
+                  -var "environment_name=$(environmentName)"
+                echo "✔ Entorno $(environmentName) eliminado. Coste residual: 0."

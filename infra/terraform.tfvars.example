@@ -1,0 +1,10 @@
+# Ejemplo de variables para un entorno efímero local.
+# En el pipeline no se usa tfvars: el nombre del entorno se pasa con
+#   -var "environment_name=qa-pr-<numero>"
+# para que cada ejecución tenga su propio entorno.
+
+environment_name = "qa-demo-local"
+location         = "swedencentral"
+owner            = "ismael"
+ttl_hours        = 4
+app_sku          = "B1"

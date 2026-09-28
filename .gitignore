@@ -1,0 +1,32 @@
+# Dependencias y builds
+node_modules/
+dist/
+app.zip
+.deploy-pkg/
+
+# Pruebas e informes
+tests/.features-gen/
+tests/reports/
+tests/test-results/
+.playwright/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform-outputs.json
+infra/terraform.tfvars
+
+# Sistema / editor
+.DS_Store
+Thumbs.db
+*.log
+.app.log
+.app.pid
+
+# ZCode
+.zcode/
+
+# Secretos locales (nunca subir)
+.ado-pat
+.ado-tmp/
